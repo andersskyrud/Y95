@@ -1,0 +1,556 @@
+---
+title: "Y95-prosjekt"
+author: "Anders Skyrud Danielsen"
+date: "2025-07-15"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Set up library paths 
+.libPaths(c("U:/library", .libPaths()))
+
+# Silencing some stuff, flick code switch on or off!
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  warning = T,
+  message = T)
+
+# Ensure correct encoding
+Sys.setlocale(category = "LC_ALL", locale = "Norwegian") 
+
+# Load required packages
+pacman::p_load(
+  tidyverse,
+  lubridate,
+  readr,
+  readxl,
+  tidylog,
+  gt,
+  gtsummary,
+  viridis
+)
+
+# Set global options
+options(scipen = 999) # Prevent scientific notation for large numbers
+
+```
+
+## Setup
+
+```{r load data}
+
+# Load the data
+nohai_episode <- read_csv2("I:/NoHAI/Data/NPR/Datafil 2/Ferdige filer/nohai_episode.csv",
+                           col_types = cols(
+                             nprEpisodeId	= col_character(), 
+                             nprInstitusjonId	= col_character(),
+                             nprBehandlingsstedId	= col_character(),
+                             nprAvdelingId	= col_character(),
+                             nprHenvisningsperiodeId = col_character()
+                           )) %>% 
+  mutate(year=year(inndatotid)) %>% 
+  filter(year>=2020 & year<=2024)
+
+nohai_pasient <- read_csv2("I:/NoHAI/Data/NPR/Datafil 2/Ferdige filer/nohai_pasient.csv") %>% 
+  rename(lopeNr = lopenr)
+
+nohai_enhet <- read_csv2("I:/NoHAI/Data/NPR/Datafil 2/Ferdige filer/nohai_enhet.csv",
+                         col_types = cols( 
+                           nprepisodeid	= col_character(), 
+                           nprbehandlingsstedId	= col_character(),
+                           nprAvdelingId	= col_character(),
+                         ))
+
+nohai_institusjon <- read_csv2("I:/NoHAI/Data/NPR/Datafil 2/Ferdige filer/nohai_institusjon.csv",
+                            col_types = cols( 
+                              nprInstitusjonId = col_character()
+                            ))
+
+nohai_kode <- read_csv2("I:/NoHAI/Data/NPR/Datafil 2/Ferdige filer/nohai_kode.csv",
+                            col_types = cols( 
+                              nprEpisodeId = col_character(),
+                              nprTilstandId = col_character()
+                            ))
+
+hospitalID_data <- read_xlsx("I:/NoHAI/Data/2024-12-16_ECDC_Tessy_Sykehus_Anders.xlsx") %>%
+  select(HospitalID = ID, institusjonId, behandlingsstedLokal, ForetakNavn, HelseforetakNavn)
+
+```
+
+```{r data wrangling}
+
+# Clean raw episode data
+nohai_episode_clean <- nohai_episode %>%
+  rename(lopeNr = lopenr) %>% 
+  filter(inntilstand != 2) %>%  # Remove dead on arrival
+  select(nprEpisodeId, nprInstitusjonId, lopeNr, inndatotid, utdatotid, nprBehandlingsstedId, nprAvdelingId, omsorgsniva) %>%
+  mutate(
+    inndatotid = as.Date(inndatotid, format = "%Y-%m-%d %H:%M:%S"),
+    utdatotid = as.Date(utdatotid, format = "%Y-%m-%d %H:%M:%S"),
+    nprbehandlingsstedId = nprBehandlingsstedId  # fix consistent variable names
+  )
+
+# Merge hospital info
+nohai_episode_clean <- nohai_episode_clean %>%
+  left_join(nohai_enhet %>%
+              select(nprepisodeid , behandlingsstedLokal) %>% 
+              rename(nprEpisodeId = nprepisodeid), 
+            by = "nprEpisodeId") %>%
+  left_join(nohai_institusjon, by = "nprInstitusjonId")
+
+nohai_episode_clean$behandlingsstedLokal <- stringr::str_replace_all(nohai_episode_clean$behandlingsstedLokal, "\\s", " ")
+hospitalID_data$behandlingsstedLokal <- stringr::str_replace_all(hospitalID_data$behandlingsstedLokal, "\\s", " ")
+
+nohai_episode_clean <- nohai_episode_clean %>% ## NB! Nødvendig å mappe en hel rekke rader manuelt her om dette skal brukes
+  left_join(hospitalID_data, by = c("institusjonId", "behandlingsstedLokal")) %>%
+  distinct()
+
+# Merge patient info
+nohai_episode_clean <- nohai_episode_clean %>%
+  left_join(nohai_pasient, by = "lopeNr") %>%
+  distinct()
+
+# Attach ICD-10 codes (without creating flags yet)
+nohai_episode_clean <- nohai_episode_clean %>%
+  left_join(nohai_kode %>%
+              group_by(nprEpisodeId) %>%
+              summarise(
+                icd10_codes_episode = list(unique(kodeVerdi))
+              ) %>%
+              ungroup(),
+            by = "nprEpisodeId")
+
+# Resolve duplicate lopeNr issues in npr_episode
+nohai_episode_clean <- nohai_episode_clean %>%
+  # Replace lopeNr with samme_person if nprEpisodeId is duplicated
+  mutate(
+    lopeNr = if_else(
+      nprEpisodeId %in% nprEpisodeId[duplicated(nprEpisodeId)],
+      samme_person,
+      lopeNr
+    )
+  ) %>%
+  # Remove duplicates based on nprEpisodeId
+  distinct(nprEpisodeId, .keep_all = TRUE) 
+
+```
+
+```{r aggregate}
+
+# Aggregate dataset from episodes to stays 
+
+episodes_to_stitch <- nohai_episode_clean %>%
+  arrange(lopeNr, HospitalID, inndatotid)  # No select! Keep everything
+
+episodes_with_stays <- episodes_to_stitch %>%
+  group_by(lopeNr, HospitalID) %>%
+  mutate(
+    time_since_last_discharge = as.numeric(inndatotid - lag(utdatotid)),
+    new_stay = case_when(
+      is.na(time_since_last_discharge) ~ 1,
+      time_since_last_discharge > 1 ~ 1,
+      time_since_last_discharge <= 1 ~ 0
+    ),
+    stay_id = cumsum(new_stay)
+  ) %>%
+  ungroup()
+
+episodes_with_stays <- episodes_with_stays %>%
+  mutate(
+    stay_id_full = paste0(lopeNr, "_", HospitalID, "_", stay_id)
+  )
+
+# Collapse to stay-level
+
+nohai_stay_level <- episodes_with_stays %>%
+  group_by(stay_id_full) %>%
+  summarise(
+    lopeNr = first(lopeNr),                              # Patient ID
+    same_person = first(samme_person),                    # Keep same_person if needed
+    HospitalID = first(HospitalID),
+    nprInstitusjonId = first(nprInstitusjonId),
+    behandlingsstedLokal = first(behandlingsstedLokal),
+    
+    stay_admission = min(inndatotid, na.rm = TRUE),       # Earliest admission
+    stay_discharge = if_else(all(is.na(utdatotid)), NA_Date_, max(utdatotid, na.rm = TRUE)), # Latest discharge
+
+    episode_ids = list(unique(nprEpisodeId)),             # List of episode IDs
+    all_icd10_codes = list(flatten_chr(icd10_codes_episode)), # Flatten all ICD-10 codes
+
+    sex = first(kjonn),                                     # Static patient characteristics
+    fodselsaar = first(fodselsar)
+  ) %>%
+  ungroup()
+
+```
+
+```{r define sepsis and HAI}
+
+# Define point prevalence survey (PPS) dates
+pps_dates <- as.Date(c(
+  "2015-05-06", "2015-11-04", "2016-05-11", "2016-11-02",
+  "2017-05-10", "2017-11-08", "2018-05-30", "2018-11-07",
+  "2019-05-22", "2019-11-06", "2020-05-13", "2020-11-04",
+  "2021-05-19", "2021-11-03", "2022-05-11", "2022-11-02",
+  "2023-05-10", "2023-11-01", "2024-05-29", "2024-11-06"
+))
+
+# Define ICD-10 code lists ---------------------------
+
+# Helper: expand ICD-10 ranges like A07/A09 → A7, A8, A9, A007, A008, A009
+expand_icd10_range <- function(start_code, end_code) {
+  start_letter <- str_extract(start_code, "^[A-Z]")
+  start_num <- as.integer(str_extract(start_code, "\\d+"))
+  end_num <- as.integer(str_extract(end_code, "\\d+"))
+  codes <- map(start_num:end_num, ~ c(
+    paste0(start_letter, .x),
+    paste0(start_letter, sprintf("%03d", .x))
+  ))
+  flatten_chr(codes)
+}
+
+# Explicit sepsis codes
+explicit_sepsis_codes <- c("A02.1", "A20.7", "A21.7", "A22.7", "A24.1", "A26.7", "A28.2",
+                           "A32.7", "A39.2", "A39.4", "A40", "A41", "A42.7", "B00.7", "B37.7") %>%
+  str_replace_all("\\.", "")  # remove decimals to match Y95-style coding
+
+# Infection focus ranges
+infection_ranges <- c("A04", "A05", "A07/A09", "A46", "A60.0", "A69.1", "A81/A89", "B08/B09", "G00/08",
+                      "H70.0", "I33", "I38/40.0", "J01/06", "J12/18", "J20/22", "J36", "J39.0/39.1",
+                      "J85/86", "K35/37", "K61", "K63.0/63.1", "K65", "K75.0", "K81.0", "K83.0", "L02/04",
+                      "L08", "M00/01", "M72.6", "M86", "N10", "N15.1", "N30", "N39.0", "N41.0", "N41.2",
+                      "N41.3", "N45", "N70/74", "N98.0", "N49", "O03.0", "O03.5", "O04.5", "O08.0", "O23",
+                      "O88.3", "O91", "T80.2", "T81.4", "T82.6/82.7", "T83.5/83.6", "T84.5/84.7", "T85.7",
+                      "T88.0")
+
+# Organ failure ranges
+organ_failure_ranges <- c("D65", "D69.5", "E87.2", "G93.4", "I46", "I95.9", "J80", "J95.2", "J96",
+                          "K72.0", "K72.9", "N00", "N17", "N99.0", "R02", "R09.0", "R09.2", "R40.0",
+                          "R40.2", "R41", "R55", "R57", "R57.2", "R65.1")
+
+# Expand ranges
+expand_list <- function(ranges) {
+  ranges %>%
+    map(function(x) {
+      parts <- str_split(x, "/", simplify = TRUE)
+      if (length(parts) == 1) {
+        code <- str_replace_all(parts[1], "\\.", "")
+        return(c(code))
+      } else {
+        expand_icd10_range(str_replace_all(parts[1], "\\.", ""),
+                           str_replace_all(parts[2], "\\.", ""))
+      }
+    }) %>%
+    flatten_chr() %>%
+    unique()
+}
+
+infection_codes <- expand_list(infection_ranges)
+organ_failure_codes <- expand_list(organ_failure_ranges)
+
+# Apply to stay-level data ---------------------------
+
+nohai_stay_level <- nohai_stay_level %>%
+  mutate(
+    icd_flat = map_chr(all_icd10_codes, ~ paste(.x, collapse = ";")),
+    
+    y95_present = str_detect(icd_flat, "\\bY95\\b") %>% as.integer(),
+
+    explicit_sepsis = map_lgl(all_icd10_codes, ~ any(str_remove_all(.x, "\\.") %in% explicit_sepsis_codes)),
+    
+    has_infection_code = map_lgl(all_icd10_codes, ~ any(str_remove_all(.x, "\\.") %in% infection_codes)),
+    has_organ_failure_code = map_lgl(all_icd10_codes, ~ any(str_remove_all(.x, "\\.") %in% organ_failure_codes)),
+
+    implicit_sepsis = (has_infection_code & has_organ_failure_code),
+    
+    any_sepsis = as.integer(explicit_sepsis | implicit_sepsis),
+    
+    sepsis_focus = case_when(
+      explicit_sepsis ~ "unknown",
+      implicit_sepsis ~ map_chr(all_icd10_codes, ~ .x[str_remove_all(.x, "\\.") %in% infection_codes][1]),
+      TRUE ~ NA_character_
+    )
+  )
+
+# Flag overlap with point prevalence survey ---------
+nohai_stay_level <- nohai_stay_level %>%
+  rowwise() %>% 
+  mutate(
+  pps_overlap = as.integer(any(pps_dates >= (stay_admission - 7) & pps_dates <= (stay_discharge + 7)))
+) %>%
+ungroup()
+
+```
+
+## Results
+
+Figure 1: Incidence rate of Y95-coded episodes.
+
+```{r figure 1}
+
+# Create date variable for grouping
+nohai_stay_level <- nohai_stay_level %>%
+  mutate(month_start = floor_date(as.Date(stay_admission), unit = "month"))
+
+# Monthly patient days — distribute annual values equally across months
+monthly_patient_days <- tibble(
+  year = 2020:2024,
+  annual_days = c(3393647, 3655588, 3748851, 3734708, 3677218)
+) %>%
+  mutate(patient_days_per_month = annual_days / 12)
+
+# Prepare Y95 counts per month
+y95_plot_data <- nohai_stay_level %>%
+  filter(!is.na(month_start), year(month_start) %in% 2020:2024) %>%
+  group_by(month_start) %>%
+  summarise(
+    y95_stays = sum(y95_present, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    year = year(month_start)
+  ) %>%
+  left_join(monthly_patient_days, by = "year") %>%
+  mutate(
+    incidence_rate = (y95_stays / patient_days_per_month) * 100000
+  )
+
+# Plot
+y95_plot <- ggplot(y95_plot_data, aes(x = month_start, y = incidence_rate)) +
+  geom_line(color = viridis(1, option = "D"), size = 1.2) +
+  geom_point(color = viridis(1, option = "D"), size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", colour = "grey30", size = 1) +
+  scale_x_date(
+    date_labels = "%b %Y",
+    date_breaks = "3 months",
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  scale_y_continuous(
+    labels = scales::label_comma(),
+    name = "Y95 per 100.000 liggedøgn"
+  ) +
+  labs(x = "Måned og år") +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+y95_plot
+
+ggsave("Figur 1.png", y95_plot, width = 12, height = 8)
+
+```
+
+Table 1. The top 20 ICD-10 diagnosis "blocks" (three characters) co-occurring with Y95.
+
+```{r figure 2}
+
+# Step 1: ICD-10 block -> Norwegian label mapping
+norwegian_labels <- tribble(
+  ~icd_block, ~diagnose_norsk,
+  "J159", "Uspesifisert bakteriell pneumoni",
+  "T814", "Infeksjon etter kirurgiske eller medisinske prosedyrer ikke klassifisert annet sted",
+  "J189", "Uspesifisert pneumoni",
+  "N390", "Urinveisinfeksjon med uspesifisert lokalisasjon",
+  "J960", "Akutt respirasjonssvikt",
+  "E876", "Hypokalemi",
+  "I10",  "Essensiell hypertensjon",
+  "N179", "Uspesifisert akutt nyresvikt",
+  "I489", "Uspesifisert atrieflimmer og atrieflutter",
+  "I509", "Uspesifisert hjertesvikt",
+  "J90",  "Pleuraeffusjon, ikke klassifisert annet sted",
+  "E86",  "Dehydrering",
+  "E119", "Diabetes mellitus type 2 uten komplikasjon",
+  "D649", "Uspesifisert anemi",
+  "I480", "Paroksysmal atrieflimmer",
+  "E871", "Hypoosmolalitet eller hyponatremi",
+  "J440", "Kronisk obstruktiv lungesykdom med akutt infeksjon i nedre luftveier",
+  "U071", "Covid-19 med påvist virus",
+  "F059", "Uspesifisert delirium",
+  "Z921", "Opplysning om langtidsbruk av antikoagulanter"
+)
+
+# Step 2: Extract top 3-character codes and join with labels
+top_icd_blocks_y95_table <- nohai_stay_level %>%
+  filter(y95_present == 1) %>%
+  select(all_icd10_codes) %>%
+  unnest(all_icd10_codes) %>%
+  filter(all_icd10_codes != "Y95") %>%
+  mutate(icd_block = str_sub(all_icd10_codes, 1, 4)) %>%
+  count(icd_block, sort = TRUE) %>%
+  left_join(norwegian_labels, by = "icd_block") %>%
+  arrange(desc(n)) %>%
+  slice_max(n, n = 21) %>% 
+  select(`ICD-10-kapittel` = icd_block,
+         `Diagnose` = diagnose_norsk,
+         `Antall` = n)
+
+# Step 3: Export to CSV
+write_csv2(top_icd_blocks_y95_table, "tabell_1.csv")
+
+```
+
+Figure 2: Proportion of T81
+
+```{r figure 2}
+
+# Flag T81 in list or flat string
+nohai_stay_level <- nohai_stay_level %>%
+  mutate(
+    T81_flag = case_when(
+     # map_lgl(all_icd10_codes, ~ any(str_starts(.x, "T81"))) ~ 1,
+      str_detect(icd_flat, "\\bT81") ~ 1,
+      TRUE ~ 0
+    )
+  )
+
+# Prepare data
+plot_data_t81 <- nohai_stay_level %>%
+  mutate(year = year(stay_admission)) %>% 
+  filter(y95_present == 1, !is.na(year)) %>%
+  group_by(year, T81_flag) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(year) %>%
+  mutate(p = n / sum(n)) %>%
+  mutate(T81_label = if_else(T81_flag == 1, "T81-kodet", "Ikke T81-kodet"))
+
+# Plot
+t81_plot <- ggplot(plot_data_t81, aes(x = factor(year), y = p, fill = T81_label)) +
+  geom_col(position = "stack", width = 0.7) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_fill_viridis_d(option = "D", begin = 0, end = 1) +
+  labs(
+    x = "År",
+    y = "Andel av Y95-kodede opphold",
+    fill = NULL
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+t81_plot
+
+ggsave("Figur 2.png", t81_plot, width = 12, height = 8)
+
+```
+
+Figure 3: Proportion of St. Olavs
+
+```{r figure 3}
+
+nohai_stay_level <- nohai_stay_level %>% 
+  mutate(year = year(stay_admission)) %>%
+  mutate(
+    hospital_group = case_when(
+      str_detect(behandlingsstedLokal, regex("St\\. Olav|ST OLAV", ignore_case = TRUE)) ~ "St. Olavs hospital", 
+      TRUE ~ "Andre sykehus"
+    ),
+    T81_label = if_else(T81_flag == 1, "Med T81", "Uten T81")
+  )
+
+# Prepare base data
+t81_y95_grouped <- nohai_stay_level %>%
+  filter(y95_present == 1) %>%
+  count(year, hospital_group, T81_label) %>%
+  complete(year, hospital_group, T81_label, fill = list(n = 0))  # ensure all combos present
+
+# Add fill colour and alpha
+plot_data <- t81_y95_grouped %>%
+  mutate(
+    fill_colour = case_when(
+      hospital_group == "St. Olavs hospital" ~ viridis(1, begin = 0.3, end = 0.4),
+      hospital_group == "Andre sykehus" ~ viridis(1, begin = 0.6, end = 0.7)
+    ),
+    alpha_value = if_else(T81_label == "Med T81", 1, 0.4),
+    fill_group = paste(hospital_group, T81_label, sep = " - ")
+  )
+
+# Add a fill_group variable
+plot_data <- plot_data %>%
+  mutate(
+    x_pos = as.numeric(factor(year)) + if_else(hospital_group == "St. Olavs hospital", -0.15, 0.15),
+    fill_group = paste(hospital_group, T81_label, sep = " – ")
+  )
+
+# Define custom colours
+fill_colours <- c(
+  "St. Olavs hospital – Med T81"  = viridis(1, begin = 0.2, alpha = 1),
+  "St. Olavs hospital – Uten T81" = viridis(1, begin = 0.2, alpha = 0.4),
+  "Andre sykehus – Med T81"       = viridis(1, begin = 0.6, alpha = 1),
+  "Andre sykehus – Uten T81"      = viridis(1, begin = 0.6, alpha = 0.4)
+)
+
+# Plot
+st_olavs_plot <- ggplot(plot_data, aes(x = x_pos, y = n, fill = fill_group)) +
+  geom_col(width = 0.3, position = "stack") +
+  scale_x_continuous(
+    breaks = seq_along(sort(unique(plot_data$year))),
+    labels = sort(unique(plot_data$year)),
+    name = "År"
+  ) +
+  scale_fill_manual(values = fill_colours, name = "Sykehus og T81-koding") +
+  labs(y = "Antall Y95-kodede opphold") +
+  theme_classic() +
+  theme(
+    legend.position = "top"
+  )
+st_olavs_plot
+
+ggsave("Figur 3.png", st_olavs_plot, width = 12, height = 8)
+
+
+```
+
+Table 3: Proportion of sepsis with Y95
+
+```{r table 3}
+
+# Explicit sepsis
+explicit_sepsis_stats <- nohai_stay_level %>%
+  filter(explicit_sepsis == 1) %>%
+  summarise(
+    n_total = n(),
+    n_y95 = sum(y95_present, na.rm = TRUE)
+  ) %>%
+  mutate(group = "Explicitly coded sepsis")
+
+# Implicit sepsis
+implicit_sepsis_stats <- nohai_stay_level %>%
+  filter(implicit_sepsis == 1) %>%
+  summarise(
+    n_total = n(),
+    n_y95 = sum(y95_present, na.rm = TRUE)
+  ) %>%
+  mutate(group = "Implicitly coded sepsis")
+
+# Combine
+table3_data <- bind_rows(
+  explicit_sepsis_stats,
+  implicit_sepsis_stats
+) %>%
+  mutate(
+    prop_y95 = n_y95 / n_total
+  ) %>%
+  select(
+    `Episode type` = group,
+    `N episodes` = n_total,
+    `N with Y95` = n_y95,
+    `% with Y95` = prop_y95
+  )
+
+# Create GT table
+table3 <- table3_data %>%
+  gt() %>%
+  fmt_percent(columns = `% with Y95`, decimals = 1) %>%
+  fmt_number(columns = c(`N episodes`, `N with Y95`), decimals = 0) %>%
+  tab_header(title = "Table 3: Y95 use across sepsis episodes")
+
+table3
+
+write_csv2(table3_data, "tabell_3.csv")
+
+```
